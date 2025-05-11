@@ -32,6 +32,7 @@ mongoose.connect(process.env.MONGODB_URI, {
 const powerBankSchema = new mongoose.Schema({
   stationId: Number,
   status: { type: String, enum: ['INUSE', 'FREE'], default: 'FREE' },
+  userId: { type: String, default: null },  // Добавлено поле userId
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -41,6 +42,7 @@ const PowerBank = mongoose.model('PowerBank', powerBankSchema);
 const paymentSchema = new mongoose.Schema({
   stationId: Number,
   powerBankId: mongoose.Schema.Types.ObjectId,
+  userId: { type: String, default: null },  // Добавлено поле userId
   amount: Number,
   currency: String,
   sessionId: String,
@@ -60,10 +62,11 @@ app.post('/initialize-data', async (req, res) => {
     ];
 
     for (const station of stations) {
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 6; i++) {
         await PowerBank.create({
           stationId: station.stationId,
-          status: 'FREE'
+          status: 'FREE',
+          userId: "null"  // По умолчанию неизвестный пользователь
         });
       }
     }
@@ -76,6 +79,7 @@ app.post('/initialize-data', async (req, res) => {
     res.status(500).json({ error: 'Failed to initialize data' });
   }
 });
+
 
 // ✅ Проверка доступности PowerBank'ов
 app.get('/check-availability/:stationId', async (req, res) => {
@@ -96,18 +100,17 @@ app.get('/check-availability/:stationId', async (req, res) => {
 });
 
 // ✅ Создание Checkout Session с проверкой доступности
+// ✅ Создание Checkout Session с userId
 app.post('/create-checkout-session', async (req, res) => {
-  const { stationId, amount } = req.body;
+  const { stationId, amount, userId } = req.body;
 
   try {
-    // Проверяем доступность PowerBank
     const availablePowerBank = await PowerBank.findOne({ stationId, status: 'FREE' });
 
     if (!availablePowerBank) {
       return res.status(400).json({ error: 'No FREE PowerBanks available at this station' });
     }
 
-    // Создание сессии оплаты
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
@@ -125,17 +128,16 @@ app.post('/create-checkout-session', async (req, res) => {
       cancel_url: `${YOUR_DOMAIN}/cancel`,
     });
 
-    // Сохранение данных платежа
     await Payment.create({
       stationId,
       powerBankId: availablePowerBank._id,
+      userId,  // Сохраняем userId
       amount,
       currency: 'usd',
       sessionId: session.id,
-      status: 'paid'
+      status: 'pending'
     });
 
-  
     res.json({ url: session.url });
 
   } catch (error) {
@@ -143,6 +145,7 @@ app.post('/create-checkout-session', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -181,6 +184,17 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
   }
 });
 
+app.get('/payments', async (req, res) => {
+  const { userId } = req.query;
+
+  try {
+    const payments = await Payment.find({ userId });
+    res.json(payments);
+  } catch (error) {
+    console.error('Error fetching payments:', error.message);
+    res.status(500).json({ error: 'Error fetching payments' });
+  }
+});
 
 // ✅ Успешная оплата
 app.get('/success', (req, res) => {
