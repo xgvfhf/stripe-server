@@ -146,6 +146,45 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+app.get('/my-powerbanks', async (req, res) => {
+  const { userId } = req.query;
+
+  try {
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const rentedPowerBanks = await PowerBank.find({ userId, status: 'INUSE' });
+
+    if (rentedPowerBanks.length === 0) {
+      return res.json([]);
+    }
+
+    res.json(rentedPowerBanks);
+  } catch (error) {
+    console.error('Error fetching user powerbanks:', error.message);
+    res.status(500).json({ error: 'Error fetching user powerbanks' });
+  }
+});
+
+app.post('/return-powerbanks', async (req, res) => {
+  const { userId } = req.body;
+
+  try {
+    const updatedPowerBanks = await PowerBank.updateMany(
+      { userId: userId, status: 'INUSE' },
+      { $set: { status: 'FREE', userId: null } }
+    );
+
+    console.log(`User ${userId} returned ${updatedPowerBanks.modifiedCount} PowerBanks`);
+    res.json({ message: `${updatedPowerBanks.modifiedCount} PowerBanks returned successfully` });
+
+  } catch (error) {
+    console.error('Error returning PowerBanks:', error.message);
+    res.status(500).json({ error: 'Error returning PowerBanks' });
+  }
+});
+
 
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
