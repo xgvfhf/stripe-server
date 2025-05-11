@@ -7,10 +7,18 @@ const bodyParser = require('body-parser');
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.raw({ type: 'application/json' }));
 
-const YOUR_DOMAIN = 'http://192.168.226.7:4242'; // // this is real ip(for testing with my phone) if u need an emulator replace to http://10.0.2.2:4242
+// Body parser для всех маршрутов, кроме /webhook
+app.use((req, res, next) => {
+  if (req.originalUrl === '/webhook') {
+    next();
+  } else {
+    bodyParser.json()(req, res, next);
+  }
+});
+
+
+const YOUR_DOMAIN = 'http://192.168.169.7:4242';
 
 // Подключение к MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
@@ -20,22 +28,86 @@ mongoose.connect(process.env.MONGODB_URI, {
   .then(() => console.log('MongoDB connected'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// Схема и модель платежа
+// ✅ Схема PowerBank
+const powerBankSchema = new mongoose.Schema({
+  stationId: Number,
+  status: { type: String, enum: ['INUSE', 'FREE'], default: 'FREE' },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const PowerBank = mongoose.model('PowerBank', powerBankSchema);
+
+// ✅ Схема платежа
 const paymentSchema = new mongoose.Schema({
+  stationId: Number,
+  powerBankId: mongoose.Schema.Types.ObjectId,
   amount: Number,
   currency: String,
   sessionId: String,
-  status: String,
+  status: { type: String, default: 'pending' },
   createdAt: { type: Date, default: Date.now }
 });
 
 const Payment = mongoose.model('Payment', paymentSchema);
 
-// Маршрут для создания Checkout Session
-app.post('/create-checkout-session', async (req, res) => {
+// ✅ Инициализация данных (для теста)
+app.post('/initialize-data', async (req, res) => {
   try {
-    const { amount } = req.body;
+    const stations = [
+      { stationId: 1 },
+      { stationId: 2 },
+      { stationId: 3 }
+    ];
 
+    for (const station of stations) {
+      for (let i = 0; i < 5; i++) {
+        await PowerBank.create({
+          stationId: station.stationId,
+          status: 'FREE'
+        });
+      }
+    }
+
+    console.log("Data initialized successfully.");
+    res.json({ message: "Data initialized successfully." });
+
+  } catch (error) {
+    console.error('Error initializing data:', error.message);
+    res.status(500).json({ error: 'Failed to initialize data' });
+  }
+});
+
+// ✅ Проверка доступности PowerBank'ов
+app.get('/check-availability/:stationId', async (req, res) => {
+  const stationId = parseInt(req.params.stationId);
+
+  try {
+    const availablePowerBanks = await PowerBank.find({ stationId, status: 'FREE' });
+
+    res.json({
+      available: availablePowerBanks.length > 0,
+      freePowerBanks: availablePowerBanks.length
+    });
+
+  } catch (error) {
+    console.error('Error checking availability:', error.message);
+    res.status(500).json({ error: 'Error checking availability' });
+  }
+});
+
+// ✅ Создание Checkout Session с проверкой доступности
+app.post('/create-checkout-session', async (req, res) => {
+  const { stationId, amount } = req.body;
+
+  try {
+    // Проверяем доступность PowerBank
+    const availablePowerBank = await PowerBank.findOne({ stationId, status: 'FREE' });
+
+    if (!availablePowerBank) {
+      return res.status(400).json({ error: 'No FREE PowerBanks available at this station' });
+    }
+
+    // Создание сессии оплаты
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
@@ -43,28 +115,27 @@ app.post('/create-checkout-session', async (req, res) => {
         {
           price_data: {
             currency: 'usd',
-            product_data: {
-              name: 'Power Bank Rental',
-            },
+            product_data: { name: `PowerBank Rental - Station ${stationId}` },
             unit_amount: amount,
           },
           quantity: 1,
         },
       ],
-      success_url: `${YOUR_DOMAIN}/success`,
+      success_url: `${YOUR_DOMAIN}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${YOUR_DOMAIN}/cancel`,
     });
 
-    // Сохраняем в MongoDB
-    const payment = new Payment({
-      amount: amount,
+    // Сохранение данных платежа
+    await Payment.create({
+      stationId,
+      powerBankId: availablePowerBank._id,
+      amount,
       currency: 'usd',
       sessionId: session.id,
-      status: 'paid',
+      status: 'paid'
     });
 
-    await payment.save();
-
+  
     res.json({ url: session.url });
 
   } catch (error) {
@@ -73,24 +144,33 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// Webhook для обновления статуса платежа
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
   const sig = req.headers['stripe-signature'];
 
+  console.log("Webhook received with signature:", sig);
+
   try {
     const event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    console.log("Webhook event parsed successfully:", event);
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
 
-      // Обновляем статус платежа в базе данных
-      await Payment.findOneAndUpdate(
+      console.log("Processing session:", session.id);
+
+      const payment = await Payment.findOneAndUpdate(
         { sessionId: session.id },
-        { status: 'paid' }
+        { status: 'paid' },
+        { new: true }
       );
 
-      console.log(`Payment ${session.id} successfully completed.`);
+      console.log("Payment updated to 'paid':", payment);
+
+      if (payment) {
+        await PowerBank.findByIdAndUpdate(payment.powerBankId, { status: 'INUSE' });
+        console.log(`PowerBank ${payment.powerBankId} set to INUSE`);
+      }
     }
 
     res.json({ received: true });
@@ -101,18 +181,19 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
   }
 });
 
-// Успешная оплата
+
+// ✅ Успешная оплата
 app.get('/success', (req, res) => {
   res.send("<h1>Payment Successful!</h1><p>Thank you for your purchase.</p>");
 });
 
-// Отмененная оплата
+// ✅ Отмененная оплата
 app.get('/cancel', (req, res) => {
   res.send("<h1>Payment Canceled</h1><p>The payment was canceled.</p>");
 });
 
-// Запуск сервера
+// ✅ Запуск сервера
 const PORT = process.env.PORT || 4242;
 app.listen(PORT, () => {
-  console.log(`Server running on http://10.0.2.2:${PORT}`);
+  console.log(`Server running on ${YOUR_DOMAIN}`);
 });
