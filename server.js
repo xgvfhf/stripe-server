@@ -171,8 +171,8 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
       console.log("Payment updated to 'paid':", payment);
 
       if (payment) {
-        await PowerBank.findByIdAndUpdate(payment.powerBankId, { status: 'INUSE' });
-        console.log(`PowerBank ${payment.powerBankId} set to INUSE`);
+        await PowerBank.findByIdAndUpdate(payment.powerBankId, { status: 'INUSE', userId: payment.userId });
+        console.log(`PowerBank ${payment.powerBankId} set to INUSE by user ${payment.userId}`);
       }
     }
 
