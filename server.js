@@ -4,6 +4,8 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const bodyParser = require('body-parser');
+const cron = require('node-cron');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(cors());
@@ -18,8 +20,6 @@ app.use((req, res, next) => {
 });
 
 
-const YOUR_DOMAIN = 'http://192.168.169.7:4242';
-
 // Подключение к MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
@@ -28,15 +28,95 @@ mongoose.connect(process.env.MONGODB_URI, {
   .then(() => console.log('MongoDB connected'))
   .catch(err => console.error('MongoDB connection error:', err));
 
+
+// Отправка письма
+async function sendReminder(email) {
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.MAIL_FROM,     // example@gmail.com
+      pass: process.env.MAIL_PASSWORD
+    }
+  });
+
+  await transporter.sendMail({
+    from: process.env.MAIL_FROM,
+    to: email,
+    subject: 'Please return the power bank',
+    text: 'You have rented a power bank over 24 hours ago. Please return it to avoid extra charges.',
+  });
+}
+
+// Планировщик
+cron.schedule('*/1 * * * *', async () => {
+  console.log('🔁 CRON JOB TRIGGERED');
+
+  const now = new Date();
+  const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  const overdueBanks = await PowerBank.find({
+    status: 'INUSE',
+    rentedAt: { $lte: dayAgo }
+  });
+
+  console.log(`[CRON] Found ${overdueBanks.length} overdue powerbanks`);
+
+  for (const bank of overdueBanks) {
+    const user = await User.findOne({ userId: bank.userId });
+
+    if (user) {
+      if (user.isBanned) {
+        console.log(`[CRON] User ${user.userId} is already banned, skipping...`);
+        continue;
+      }
+
+      if (user.remindersSent >= 3) {
+        user.isBanned = true;
+        await user.save();
+        console.log(`[CRON] User ${user.userId} has been banned after 3 reminders.`);
+        continue;
+      }
+
+      if (user.email) {
+        try {
+          await sendReminder(user.email);
+          user.remindersSent += 1;
+          await user.save();
+          console.log(`[CRON] Reminder sent to ${user.email} (${user.remindersSent}/3)`);
+        } catch (err) {
+          console.error(`[CRON ERROR] Failed to send reminder to ${user.email}:`, err.message);
+        }
+      }
+    }
+  }
+});
+
+
+
+
+const YOUR_DOMAIN = 'http://192.168.123.7:4242';
+
+
+
+// Схема пользователя
+const userSchema = new mongoose.Schema({
+  userId: String,
+  email: String,
+  remindersSent: { type: Number, default: 0 },
+  isBanned: { type: Boolean, default: false }
+});
+
 // ✅ Схема PowerBank
 const powerBankSchema = new mongoose.Schema({
   stationId: Number,
   status: { type: String, enum: ['INUSE', 'FREE'], default: 'FREE' },
   userId: { type: String, default: null },  // Добавлено поле userId
-  createdAt: { type: Date, default: Date.now }
+  rentedAt: { type: Date, default: null }
 });
 
+const User = mongoose.model('User', userSchema);
 const PowerBank = mongoose.model('PowerBank', powerBankSchema);
+
 
 // ✅ Схема платежа
 const paymentSchema = new mongoose.Schema({
@@ -66,7 +146,8 @@ app.post('/initialize-data', async (req, res) => {
         await PowerBank.create({
           stationId: station.stationId,
           status: 'FREE',
-          userId: "null"  // По умолчанию неизвестный пользователь
+          userId: "null",
+          rentedAt: null  // По умолчанию неизвестный пользователь
         });
       }
     }
@@ -80,6 +161,15 @@ app.post('/initialize-data', async (req, res) => {
   }
 });
 
+app.get('/check-ban', async (req, res) => {
+  const { userId } = req.query;
+  try {
+    const user = await User.findOne({ userId });
+    res.json({ isBanned: user?.isBanned || false });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error checking ban status' });
+  }
+});
 
 // ✅ Проверка доступности PowerBank'ов
 app.get('/check-availability/:stationId', async (req, res) => {
@@ -185,6 +275,22 @@ app.post('/return-powerbanks', async (req, res) => {
   }
 });
 
+app.post('/register-user', async (req, res) => {
+  const { userId, name, email } = req.body;
+
+  try {
+    const existing = await User.findOne({ userId });
+    if (!existing) {
+      await User.create({ userId, name, email });
+      console.log(`User ${email} registered`);
+    }
+    res.status(200).json({ message: 'User registered or already exists' });
+  } catch (error) {
+    console.error('User registration error:', error.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -210,7 +316,7 @@ app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, r
       console.log("Payment updated to 'paid':", payment);
 
       if (payment) {
-        await PowerBank.findByIdAndUpdate(payment.powerBankId, { status: 'INUSE', userId: payment.userId });
+        await PowerBank.findByIdAndUpdate(payment.powerBankId, { status: 'INUSE', userId: payment.userId, rentedAt: new Date() });
         console.log(`PowerBank ${payment.powerBankId} set to INUSE by user ${payment.userId}`);
       }
     }
