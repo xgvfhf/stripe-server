@@ -43,7 +43,7 @@ async function sendReminder(email) {
     from: process.env.MAIL_FROM,
     to: email,
     subject: 'Please return the power bank',
-    text: 'You have rented a power bank over 24 hours ago. Please return it to avoid extra charges.',
+    text: 'You have rented a power bank over 24 hours ago. Please return it to avoid account ban',
   });
 }
 
@@ -52,7 +52,7 @@ cron.schedule('*/1 * * * *', async () => {
   console.log('🔁 CRON JOB TRIGGERED');
 
   const now = new Date();
-  const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const dayAgo = new Date(now.getTime() - 60 * 1000);
 
   const overdueBanks = await PowerBank.find({
     status: 'INUSE',
@@ -101,17 +101,31 @@ const YOUR_DOMAIN = 'http://192.168.123.7:4242';
 // Схема пользователя
 const userSchema = new mongoose.Schema({
   userId: String,
+  name: String,
   email: String,
   remindersSent: { type: Number, default: 0 },
-  isBanned: { type: Boolean, default: false }
+  isBanned: { type: Boolean, default: false },
+  role: { type: String, enum: ['user', 'admin'], default: 'user' }
 });
+
+
+// Station schema
+const stationSchema = new mongoose.Schema({
+  stationId: Number,
+  location: String,
+  capacity: Number
+});
+
+const Station = mongoose.model('Station', stationSchema);
+
 
 // ✅ Схема PowerBank
 const powerBankSchema = new mongoose.Schema({
   stationId: Number,
   status: { type: String, enum: ['INUSE', 'FREE'], default: 'FREE' },
   userId: { type: String, default: null },  // Добавлено поле userId
-  rentedAt: { type: Date, default: null }
+  rentedAt: { type: Date, default: null },
+  
 });
 
 const User = mongoose.model('User', userSchema);
@@ -236,6 +250,18 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+app.get('/get-user', async (req, res) => {
+  const { userId } = req.query;
+  try {
+    const user = await User.findOne({ userId });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
 app.get('/my-powerbanks', async (req, res) => {
   const { userId } = req.query;
 
@@ -244,18 +270,27 @@ app.get('/my-powerbanks', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    const rentedPowerBanks = await PowerBank.find({ userId, status: 'INUSE' });
+    const powerBanks = await PowerBank.find({ userId, status: 'INUSE' });
 
-    if (rentedPowerBanks.length === 0) {
-      return res.json([]);
-    }
+    const result = await Promise.all(
+      powerBanks.map(async (bank) => {
+        const station = await Station.findOne({ stationId: bank.stationId });
+        return {
+          id: bank._id,
+          stationId: bank.stationId,
+          location: station ? station.location : 'Unknown',
+          rentedAt: bank.rentedAt
+        };
+      })
+    );
 
-    res.json(rentedPowerBanks);
+    res.json(result);
   } catch (error) {
     console.error('Error fetching user powerbanks:', error.message);
     res.status(500).json({ error: 'Error fetching user powerbanks' });
   }
 });
+
 
 app.post('/return-powerbanks', async (req, res) => {
   const { userId } = req.body;
@@ -290,6 +325,51 @@ app.post('/register-user', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+
+
+// Получить всех пользователей
+app.get('/users', async (req, res) => {
+  try {
+    const users = await User.find(
+      { role: 'user' }, // ← фильтруем только пользователей
+      'userId name email role isBanned remindersSent'
+    );
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+
+// ✅ Обновить статус пользователя (бан / разбан)
+app.post('/user-status', async (req, res) => {
+  const { userId, action } = req.body;
+
+  if (!userId || !['ban', 'unban'].includes(action)) {
+    return res.status(400).json({ error: 'Invalid request' });
+  }
+
+  try {
+    const isBanned = action === 'ban';
+    const updatedUser = await User.findOneAndUpdate(
+      { userId },
+      { $set: { isBanned } },
+      { new: true }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: `User ${userId} was ${isBanned ? 'banned' : 'unbanned'} successfully`
+    });
+  } catch (error) {
+    console.error('[ERROR] Failed to update user status:', error.message);
+    res.status(500).json({ error: 'Failed to update user status' });
+  }
+});
+
 
 
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
